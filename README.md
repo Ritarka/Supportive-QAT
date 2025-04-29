@@ -1,4 +1,4 @@
-# EfficientQAT
+# SupportiveQAT
 Official PyTorch implementation of **SupportiveQAT**, a framework for improving Quantization-Aware Training (QAT) stability in LLMs using Elastic Averaging SGD (EASGD).
 
 ## Contents
