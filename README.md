@@ -61,7 +61,7 @@ The file `main_e2e_qp.py` implements the **End-to-End Quantization-Aware Trainin
 - **Reproducibility**  
   Includes checkpointing, seeding, and caching logic.
 
-### Key Files Used
+### Key Files Used in e2e
 
 - `quantize/int_linear_real.py`: Quantized layer and model structure.
 - `datautils_block.py` and `datautils_e2e.py`: Dataset loading and preprocessing utilities.
