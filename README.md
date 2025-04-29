@@ -3,9 +3,7 @@ Official PyTorch implementation of **SupportiveQAT**, a framework for improving 
 
 ## Contents
 - [Installation](#installation)
-- [Model Preparation](#model-preparation)
 - [Training](#training)
-- [Evaluation](#evaluation)
 - [Citation](#citation)
 
 ## Installation
