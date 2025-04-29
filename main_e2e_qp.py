@@ -20,7 +20,6 @@ from transformers import (
     LlamaTokenizer
 )
 
-
 from datautils_block import test_ppl
 from datautils_e2e import make_data_module
 from bitsandbytes.optim import AdamW
@@ -28,6 +27,9 @@ import os
 import utils
 import math
 from math import log
+import copy
+from quantize.utils import set_op_by_name
+import quantize.int_linear_fake as int_linear_fake
 
 from quantize.int_linear_real import load_quantized_model
 from pathlib import Path
@@ -37,7 +39,8 @@ from torch.utils.data import DataLoader
 import wandb
 from quantize.quantizer import UniformAffineQuantizer, RoundUpQuantizer, RoundDownQuantizer
 from quantize.int_linear_real import QuantLinear
-
+import traceback
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 
 
 def is_ipex_available():
@@ -236,8 +239,8 @@ class GenerationArguments:
     length_penalty: Optional[float] = field(default=1.0)
     no_repeat_ngram_size: Optional[int] = field(default=0)
 
+## use CUDA_VISIBLE_DEVICES to select the GPU
 global_device = "cuda:0"
-# global_device = "cuda:1"
 
 def get_accelerate_model(args, checkpoint_dir, quant_linear_type=QuantLinear.QuantType.REGULAR):
 
@@ -405,28 +408,30 @@ def copy_dataloader(dataloader):
     )
 
 class EASGD():
-    def __init__(self, model_list, alpha=0.001, beta=0.99, stickiness=5):
+    def __init__(self, model_list, alpha=0.001, beta=0.99, stickiness=5, learning_rate=2e-5, grad_accum=1):
         super().__init__()
         self.alpha = alpha
         self.beta = beta
         self.stickiness = stickiness
+        self.grad_accum = grad_accum
+        self.learning_rate = learning_rate
         
         self.num_workers = len(model_list) - 1
 
         self.main_model = model_list[0].to(global_device)
         
         params = []
-        params.append({'params': [p for n, p in self.main_model.named_parameters() if 'scale' in n], 'weight_decay': 0.0, 'lr': 2e-5})
+        params.append({'params': [p for n, p in self.main_model.named_parameters() if 'scale' in n], 'weight_decay': 0.0, 'lr': learning_rate})
         self.main_optimizer = AdamW(params)
 
-        self.models = model_list[1:]
+        self.models = model_list[1:] if len(model_list) > 1 else []
         self.optimizers = []
 
         for model in self.models:
             model.load_state_dict(self.main_model.state_dict())
             
             params = []
-            params.append({'params': [p for n, p in model.named_parameters() if 'scale' in n], 'weight_decay': 0.0, 'lr': 2e-5})
+            params.append({'params': [p for n, p in model.named_parameters() if 'scale' in n], 'weight_decay': 0.0, 'lr': learning_rate})
             optimizer = AdamW(params)
 
             self.optimizers.append(optimizer)
@@ -464,7 +469,7 @@ class EASGD():
         for model in self.models[1:]:
             model.to(global_device, non_blocking=True)
 
-    def train_easgd(self, trainloader, testloader):
+    def train_easgd(self, trainloader, testloader, name="errant"):
         
         train_losses = []
         test_losses = []
@@ -478,10 +483,15 @@ class EASGD():
                   "alpha": self.alpha,
                   "beta": self.beta,
                   "stickiness": self.stickiness,
-                  "explanation": "actual_quantization_hopefully",
+                  "learning_rate": self.learning_rate,
+                  "grad_accum": self.grad_accum,
+                  "explanation": "something or the other",
                   }
-        run_name = f"fq_alpha_{self.alpha}_beta_{self.beta}_stickiness_{self.stickiness}"
-        wandb.init(project="train_fq_easgd", name=run_name, config=config)
+        # run_name = f"fq_alpha_{self.alpha}_beta_{self.beta}_stickiness_{self.stickiness}_lr_{self.learning_rate}_grad_accum_{self.grad_accum}"
+        # run_name = f"stickiness_{self.stickiness}_grad_accum_{self.grad_accum}"
+        run_name = f"learning_rate_{self.learning_rate}"
+        
+        wandb.init(project=name, name=run_name, config=config)
         
         self._initialize_weights()
                 
@@ -492,6 +502,9 @@ class EASGD():
         # for model in self.models:
         #     wandb.watch(model, log="all", log_freq=10)
 
+        accum_counter = 0
+        VALIDATION_STEPS = 100
+        # acc_losses = []
         for i, batch in enumerate(tqdm(trainloader)):
             model = self.models[model_choice]
             optimizer = self.optimizers[model_choice]
@@ -499,162 +512,140 @@ class EASGD():
             outputs = model(**batch)
             loss = outputs.loss
             
+            train_loss = loss.item() / len(batch["input_ids"])
+            # acc_losses.append(train_loss)
+            
+            
+            wandb.log({f"model_{model_choice}_loss": loss.item()}, commit=False)
+
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
+                        
+            # accum_counter += 1
+            # if accum_counter % self.grad_accum == 0:
+            #     loss = loss / self.grad_accum
+            #     loss.backward()
+            #     optimizer.step()
+            #     optimizer.zero_grad()
+            #     accum_counter = 0
 
-            train_loss = loss.item()
+            #     train_losses.append(sum(acc_losses) / len(acc_losses))
+            #     acc_losses = []
+                
+            # sticky_count += self.grad_accum
+            # if sticky_count >= stickiness:
+            #     sticky_count = 0
+            #     # self.models[model_choice].to("cpu", non_blocking=True)
+            #     model_choice = (model_choice + 1) % self.num_workers
+
+            #     if model_choice == 0:
+            #         self.synchronize_models(batch)            
+                    
+            if i % VALIDATION_STEPS == 0:
+                for model in self.models:
+                    model.to("cpu")
+                self.main_model.to(global_device)
+                
+                total_loss = 0.0
+                for batch in tqdm(testloader):
+                    outputs = self.main_model(**batch)
+                    loss = outputs.loss
+                    test_loss = loss.item() / len(batch["input_ids"])
+                    total_loss += test_loss
+                test_loss = total_loss / len(testloader)
+                wandb.log({"test_loss": test_loss}, commit=False)
             
-            train_loss = train_loss / len(batch["input_ids"])
-            train_losses.append(train_loss)
-            
-            # Free memory
-            # del batch, outputs, loss
-            # torch.cuda.empty_cache()
-            # gc.collect()
-
-
-            sticky_count += 1
-            if sticky_count > stickiness:
-                sticky_count = 0
-                # self.models[model_choice].to("cpu", non_blocking=True)
-                model_choice = (model_choice + 1) % self.num_workers
-
-                if model_choice == 0:
-                    self.synchronize_models(batch)            
-        
-            
-            mem_allocated = torch.cuda.memory_allocated() / 1e9
-            mem_reserved = torch.cuda.memory_reserved() / 1e9
-            # print(f"Memory allocated: {mem_allocated:.2f} GB")
-            # print(f"Memory reserved: {mem_reserved:.2f} GB")
-            
-            last_elements = train_losses[-40:] if len(train_losses) >= 40 else train_losses
-            avg_loss =  sum(last_elements) / len(last_elements)
-
-
-            logs = {"loss": train_loss,
-                    "avg_loss": avg_loss,
-                    "batch": i,
-                    "log_batch": log(i + 1, 10), 
-                    }
+            logs = {"loss": train_loss}
             wandb.log(logs)
-            
+
             # stop early so we can run experiments faster
             if i > 1250:
                 break
         
         wandb.finish()
-
-        return train_losses, train_losses
     
-    def train_regular(self, trainloader, testloader):
-        wandb.init(project="train_regular", config={"epochs": 1, "batch_size": trainloader.batch_size})
+    def train_regular(self, trainloader, testloader, name="errant"):        
+        config = {
+                  "batch_size": trainloader.batch_size,
+                  "stickiness": self.stickiness,
+                  "learning_rate": self.learning_rate,
+                  "explanation": "something or the other",
+                }
+        run_name = f"stickiness_{self.stickiness}_learning_rate_{self.learning_rate}"
+        # run_name = f"baseline"
+        wandb.init(project=name, name=run_name, config=config)
         
         self._initialize_weights()
-        
-        train_losses = []
-        test_losses = []
-        model_choice = 0
-        
-        # wandb.watch(self.main_model, log="all", log_freq=10)
-        
-        for model in self.models:
-            model.to("cpu")
-    
+                
+        self.main_model.to(global_device)
         model = self.main_model
         optimizer = self.main_optimizer
-
+        
+        num_swaps = 0
+        
+        VALIDATION_STEPS = 100
         for i, batch in enumerate(tqdm(trainloader)):
+            
+            if i % self.stickiness == 0:
+                # we gotta swap the model param types
+                num_quant_linears = 0
+                parity = num_swaps % 2
+                for name, module in model.named_modules():
+                    if isinstance(module, QuantLinear) and not 'head' in name:
+                        num_quant_linears += 1
+                        if num_quant_linears % 2 == parity:
+                            if num_swaps % 3 == 0:
+                                module.set_quant_type("regular")
+                            elif num_swaps % 3 == 1:
+                                module.set_quant_type("up")
+                            elif num_swaps % 3 == 2:
+                                module.set_quant_type("down")
+                                
+                            for param in module.parameters():
+                                param.requires_grad_(True)
+
+                        else:
+                            module.set_quant_type("down")
+                            for param in module.parameters():
+                                param.requires_grad_(False)
+                num_swaps += 1
+
 
             outputs = model(**batch)
             loss = outputs.loss
             
+            train_loss = loss.item() / len(batch["input_ids"])
+
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
-
-            train_loss = loss.item()
-        
-            train_loss = train_loss / len(batch["input_ids"])
-            train_losses.append(train_loss)
+                                            
+            if i % VALIDATION_STEPS == 0:
+                for model in self.models:
+                    model.to("cpu")
+                self.main_model.to(global_device)
+                
+                total_loss = 0.0
+                for batch in tqdm(testloader):
+                    outputs = self.main_model(**batch)
+                    loss = outputs.loss
+                    test_loss = loss.item() / len(batch["input_ids"])
+                    total_loss += test_loss
+                test_loss = total_loss / len(testloader)
+                wandb.log({"test_loss": test_loss}, commit=False)
             
-            wandb.log({"batch": i, "loss": train_loss})
+            logs = {"loss": train_loss}
+            wandb.log(logs)
+
+            if i > 1250:
+                break
         
         wandb.finish()
-
-        return train_losses, train_losses
-    
-    
-    def train_interleave(self, trainloader, regular_model):
         
-        params = []
-        params.append({'params': [p for n, p in regular_model.named_parameters() if 'scale' in n], 'weight_decay': 0.0, 'lr': 2e-5})
-        regular_optimizer = AdamW(params)
-        
-        wandb.init(project="train_interleave", config={"epochs": 1, "batch_size": trainloader.batch_size})
-        
-        self._initialize_weights()
-        
-        train_losses = []
-        test_losses = []
-        model_choice = 0
-        
-        self.main_model.to("cpu")
-        for model in self.models:
-            model.to("cpu")
-        self.models[model_choice].to("cuda")
-        
-        for i, batch in enumerate(tqdm(trainloader)):
-            model = self.models[model_choice]
-            optimizer = self.optimizers[model_choice]
-
-            # Run and test EASGD model first
-            outputs = model(**batch)
-            loss = outputs.loss
-            
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
-            torch.cuda.empty_cache()
-
-            loss_easgd = loss.item()
-
-            model_choice = (model_choice + 1) % self.num_workers
-
-            model.to("cpu")
-            if model_choice == 0:
-                self.synchronize_models()
-            self.models[model_choice].to("cuda", non_blocking=True)
-                
-                
-            # Run and tes the regular model afterwards
-            outputs = regular_model(**batch)
-            loss = outputs.loss
-            loss.backward()
-            regular_optimizer.step()
-            regular_optimizer.zero_grad()
-            
-            loss_reg = loss.item()
-            torch.cuda.empty_cache()
-        
-            loss_easgd = loss_easgd / len(batch["input_ids"])
-            loss_reg = loss_reg / len(batch["input_ids"])
-            
-            mem_allocated = torch.cuda.memory_allocated() / 1e9
-            mem_reserved = torch.cuda.memory_reserved() / 1e9
-            print(f"Memory allocated: {mem_allocated:.2f} GB")
-            print(f"Memory reserved: {mem_reserved:.2f} GB")
-
-                        
-            wandb.log({"loss_easgd": loss_easgd, "loss_reg": loss_reg})        
-        wandb.finish()
-
-        return train_losses, train_losses
-    
 from quantize.utils import set_quant_state
 
-def train(alpha=0.001, beta=0.99, stickiness=5):
+def train(alpha=0.001, beta=0.99, stickiness=5, learning_rate=2e-5, grad_accum=1):
     hfparser = transformers.HfArgumentParser((
         ModelArguments, DataArguments, TrainingArguments, GenerationArguments
     ))
@@ -673,24 +664,29 @@ def train(alpha=0.001, beta=0.99, stickiness=5):
     if completed_training:
         print('Detected that training was already completed!')
 
-    model1, tokenizer = get_accelerate_model(args, checkpoint_dir, QuantLinear.QuantType.REGULAR)
-    model2, _         = get_accelerate_model(args, checkpoint_dir, QuantLinear.QuantType.UP)
-    model3, _         = get_accelerate_model(args, checkpoint_dir, QuantLinear.QuantType.DOWN)
-    # model4, _ = get_accelerate_model(args, checkpoint_dir)
+    # model1, tokenizer = get_accelerate_model(args, checkpoint_dir, QuantLinear.QuantType.REGULAR)
+    # model2, _         = get_accelerate_model(args, checkpoint_dir, QuantLinear.QuantType.UP)
+    # model3, _         = get_accelerate_model(args, checkpoint_dir, QuantLinear.QuantType.DOWN)
+    # # model4, _ = get_accelerate_model(args, checkpoint_dir)
     
-    model2.to("cpu")
-    model3.to("cpu")
+    config = AutoConfig.from_pretrained(args.quant_model_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.quant_model_path, use_fast=False, legacy=False)
+    model1 = AutoModelForCausalLM.from_pretrained(args.quant_model_path, config=config, device_map='cpu', torch_dtype=torch.float16)
+    model1.to(global_device)
+    
+    # model2.to("cpu")
+    # model3.to("cpu")
 
     # Enabled gradient checkpointing
     model1.config.use_cache = False
-    model2.config.use_cache = False
-    model3.config.use_cache = False
+    # model2.config.use_cache = False
+    # model3.config.use_cache = False
     # model4.config.use_cache = False
         
     models = nn.ModuleList([
         model1,
-        model2,
-        model3,
+        # model2,
+        # model3,
     ])
     
     print('loaded models')
@@ -698,11 +694,39 @@ def train(alpha=0.001, beta=0.99, stickiness=5):
 
     data_module = make_data_module(tokenizer=tokenizer, args=args)
     
-    for model in models:    
-        for name, module in model.named_modules():
-            if isinstance(module, QuantLinear) and not 'head' in name:
-                module.scales.requires_grad = True
-        set_quant_state(model, True)
+    layers = model1.model.layers
+    for block_index in range(len(layers)):
+        # logger.info(f"=== Start quantize blocks {block_index}===")
+        # step 6.1: replace torch.nn.Linear with QuantLinear for QAT
+        layer = layers[block_index].to(global_device)
+        qlayer = copy.deepcopy(layer)
+        for name, module in qlayer.named_modules():
+            if isinstance(module,torch.nn.Linear):
+                quantlinear = int_linear_fake.QuantLinear(module, args.wbits, args.group_size, int_linear_fake.QuantLinear.QuantType.REGULAR)
+                set_op_by_name(qlayer, name, quantlinear)  
+                del module  
+        qlayer.to(global_device)
+
+        
+    num_quant_linears = 0
+    for name, module in model1.named_modules():
+        if isinstance(module, int_linear_fake.QuantLinear) and not 'head' in name:
+            print("hello!")
+            module.scales.requires_grad = True
+            num_quant_linears += 1
+            if num_quant_linears % 2 == 1:
+                module.set_quant_type("up")
+            else:
+                module.set_quant_type("down")
+                for param in module.parameters():
+                    param.requires_grad_(False)
+
+    set_quant_state(model1, True)
+    
+    print(f"traininable params: {sum(p.numel() for p in model1.parameters() if p.requires_grad)}")
+    
+    print(f"Number of quant linears: {num_quant_linears}")
+    exit()
 
 
     optimizer_grouped_parameters = []
@@ -719,33 +743,21 @@ def train(alpha=0.001, beta=0.99, stickiness=5):
     )
             
     train_dataloader = trainer.get_train_dataloader()
-    # test_dataloader = trainer.get_test_dataloader()
+    test_dataloader = trainer.get_eval_dataloader()
     trainer.model.train()
     
     assert next(trainer.model.parameters()).is_cuda
     assert train_dataloader is not None
+    assert test_dataloader is not None
     
-    easgd = EASGD(models, alpha, beta, stickiness)
-    train_losses, test_losses = easgd.train_easgd(train_dataloader, None)
-    # train_losses, test_losses = easgd.train_regular(train_dataloader, None)
-    # train_losses, test_losses = easgd.train_interleave(train_dataloader, model4)
+    easgd = EASGD(models, alpha, beta, stickiness, learning_rate, grad_accum)
+    # easgd.train_easgd(train_dataloader, test_dataloader, "testing_ignore")
+    easgd.train_regular(train_dataloader, test_dataloader, "testing_ignore")
     
-    # Verifying the datatypes and parameter counts before training.
-    # print_trainable_parameters(args, model1)
-    # dtypes = {}
-    # for _, p in model1.named_parameters():
-    #     dtype = p.dtype
-    #     if dtype not in dtypes: dtypes[dtype] = 0
-    #     dtypes[dtype] += p.numel()
-    # total = 0
-    # for k, v in dtypes.items(): total+= v
-    # for k, v in dtypes.items():
-    #     print(k, v, v/total)
-
-    # all_metrics = {"run_name": args.run_name}
+    
     del model1
-    del model2
-    del model3
+    # del model2
+    # del model3
     torch.cuda.empty_cache()
     gc.collect()
     print(args.output_dir)
@@ -766,7 +778,7 @@ def send_email(message, subject=None):
     smtp_server = "smtp.gmail.com"
     sender_email = "ritarka.samanta@gmail.com"  # Enter your address
     receiver_email = "ritarka.samanta@gmail.com"  # Enter receiver address
-    password = "wzhq ckib pcco ekjp"
+    password = "tlgh twex qjuj tnzl"
     message = (
         f"Subject: {subject}\n"
         f"\n"
@@ -797,21 +809,34 @@ if __name__ == "__main__":
         # stickiness_list = [5, 7, 10]
         
         # Cuda 1
-        alpha_list = [0, 0.000025, 0.000075, 0.0002]      # 4
-        beta_list = [0.95, 1.0, 1.1, 1.2]                 # 4
-        stickiness_list = [5, 9, 12]                      # 4
+        # alpha_list = [0, 0.000025, 0.000075, 0.0002]      # 4
+        # beta_list = [0.95, 1.0, 1.1, 1.2]                 # 4
+        # stickiness_list = [5, 9, 12]                      # 4
         # Total: 4 × 4 × 3 = 64 combinations
+        alpha_list = [0.000075]
+        beta_list = [1]
+        # stickiness_list = [1, 8, 16]
+        stickiness_list = [1, 4, 8, 16]
+        learning_rate_list = [2e-5]
+        # grad_accum_list = [1, 8, 16]
+        grad_accum_list = [1]
 
 
-        for alpha, beta, stickiness in itertools.product(alpha_list, beta_list, stickiness_list):
-            logging.info(f"Running alpha={alpha}, beta={beta}, stickiness={stickiness}")
+        for alpha, beta, stickiness, lr, ga in itertools.product(alpha_list, beta_list, stickiness_list, learning_rate_list, grad_accum_list):
+            logging.info(f"Running alpha={alpha}, beta={beta}, stickiness={stickiness}, lr={lr}, ga={ga}")
             
-            result = train(alpha=alpha, beta=beta, stickiness=stickiness)
+            # print(stickiness, ga)
+            result = train(alpha=alpha, beta=beta, stickiness=stickiness, learning_rate=lr, grad_accum=ga)
             
             gc.collect()
             torch.cuda.empty_cache()
 
-            logging.info(f"alpha={alpha}, beta={beta}, stickiness={stickiness}")
+            logging.info(f"alpha={alpha}, beta={beta}, stickiness={stickiness}, lr={lr}, ga={ga}")
+            
+        send_email(
+            message="Training completed successfully!",
+            subject="Training Completed"
+        )
 
     except Exception as e:
         print(f"Error during training: {e}")
@@ -819,3 +844,5 @@ if __name__ == "__main__":
             message=f"Error during training: {e}",
             subject="Training Error"
         )
+        traceback.print_exc()
+        wandb.finish(exit_code=-1)

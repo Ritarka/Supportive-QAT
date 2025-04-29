@@ -28,7 +28,7 @@ def evaluate(model, tokenizer, args, logger):
     '''
     # import pdb;pdb.set_trace()
     block_class_name = model.model.layers[0].__class__.__name__
-    device_map = infer_auto_device_map(model, max_memory={1: args.max_memory for i in range(torch.cuda.device_count())}, no_split_module_classes=[block_class_name])
+    device_map = infer_auto_device_map(model, max_memory={i: args.max_memory for i in range(torch.cuda.device_count())}, no_split_module_classes=[block_class_name])
     model = dispatch_model(model, device_map=device_map)
     results = {}
 
@@ -169,7 +169,7 @@ def main():
         model.save_pretrained(args.save_quant_dir)  
         tokenizer.save_pretrained(args.save_quant_dir) 
         logger.info("save model success")
-    evaluate(model, tokenizer, args,logger)
+    # evaluate(model, tokenizer, args,logger)
 
 
 

@@ -1,5 +1,5 @@
 CUDA_VISIBLE_DEVICES=1 python main_e2e_qp.py \
-    --quant_model_path ./output/block_ap_models/Meta-Llama-3-8B-Copy \
+    --quant_model_path /home/intern/ritarka/models/Meta-Llama-3-8B-Instruct \
     --model_family Llama-3 \
     --wbits 2 \
     --group_size 64 \
@@ -10,8 +10,8 @@ CUDA_VISIBLE_DEVICES=1 python main_e2e_qp.py \
     --do_train True \
     --pt_context_len 4096 \
     --per_device_train_batch_size 1 \
-    --per_device_eval_batch_size 4 \
-    --gradient_accumulation_steps 8 \
+    --per_device_eval_batch_size 1 \
+    --gradient_accumulation_steps 12 \
     --logging_steps 1 \
     --save_strategy epoch \
     --training_strategy epochs \
@@ -26,3 +26,4 @@ CUDA_VISIBLE_DEVICES=1 python main_e2e_qp.py \
     --eval_tasks  piqa,arc_easy,arc_challenge,hellaswag,winogrande \
     --preprocessing_num_workers 32 \
     --do_ppl_eval
+    # --quant_model_path ./output/block_ap_models/Meta-Llama-3-8B-Copy \

@@ -113,6 +113,18 @@ class QuantLinear(nn.Module, TritonModuleMixin):
     def post_init(self):
         pass
 
+    def set_quant_type(self, quant_type):
+        if quant_type == "regular":
+            self.quant_type = self.QuantType.REGULAR
+            self.rounding_func = round_ste
+        elif quant_type == "up":
+            self.quant_type = self.QuantType.UP
+            self.rounding_func = round_up_ste
+        elif quant_type == "down":
+            self.quant_type = self.QuantType.DOWN
+            self.rounding_func = round_down_ste
+        else:
+            raise NotImplementedError("Only REGULAR, UP, DOWN quantization are supported.")
 
     def use_fake_quantization(self, del_quant=False,transpose=False):
         # use fake quantization for faster training but consume more memory
@@ -234,28 +246,28 @@ class QuantLinear(nn.Module, TritonModuleMixin):
             if self.fake_transpose:
                 weight = weight.transpose(0,1)
                 
-        else:
-            # Unpack and dequantize weights, scales, and zeros
-            weight = dequant_dim0(self.qweight, self.bits, self.maxq, self.infeatures, self.outfeatures)
-            zeros = dequant_dim1(self.qzeros, self.bits, self.maxq, self.zeros_dim0, self.zeros_dim1)
-
-            dim0, dim1 = weight.shape
-            sv = self.scales.view(-1, 1, dim1)
-            zv = zeros.view(-1, 1, dim1)
-            
-            weight = ((weight.view(-1, self.group_size, dim1) - zv) * sv)
-                        
-            # we now have full-precision weights, lets fake quantize them
-            weight = self.rounding_func(weight / sv + zv)
-            weight = (weight - zv) * sv
-            weight = weight.reshape(dim0, dim1)
-
         # else:
+        #     # Unpack and dequantize weights, scales, and zeros
         #     weight = dequant_dim0(self.qweight, self.bits, self.maxq, self.infeatures, self.outfeatures)
-        #     dim0, dim1 = weight.shape
-        #     # dim2 = (dim1*dim0)//self.group_size
         #     zeros = dequant_dim1(self.qzeros, self.bits, self.maxq, self.zeros_dim0, self.zeros_dim1)
-        #     weight = ((weight.view(-1, self.group_size, dim1) - zeros.view(-1, 1, dim1)) * self.scales.view(-1, 1, dim1)).reshape(dim0, dim1)
+
+        #     dim0, dim1 = weight.shape
+        #     sv = self.scales.view(-1, 1, dim1)
+        #     zv = zeros.view(-1, 1, dim1)
+            
+        #     weight = ((weight.view(-1, self.group_size, dim1) - zv) * sv)
+                        
+        #     # we now have full-precision weights, lets fake quantize them
+        #     weight = self.rounding_func(weight / sv + zv)
+        #     weight = (weight - zv) * sv
+        #     weight = weight.reshape(dim0, dim1)
+
+        else:
+            weight = dequant_dim0(self.qweight, self.bits, self.maxq, self.infeatures, self.outfeatures)
+            dim0, dim1 = weight.shape
+            # dim2 = (dim1*dim0)//self.group_size
+            zeros = dequant_dim1(self.qzeros, self.bits, self.maxq, self.zeros_dim0, self.zeros_dim1)
+            weight = ((weight.view(-1, self.group_size, dim1) - zeros.view(-1, 1, dim1)) * self.scales.view(-1, 1, dim1)).reshape(dim0, dim1)
 
         out = torch.matmul(x, weight.to(x.dtype))
         out = out + self.bias if self.bias is not None else out
