@@ -18,7 +18,7 @@ cd Supportive-QAT
 pip install -r ritarka_env.txt
 ```
 
-3. Install Model
+3. Install Model <br>
 Download and extract Meta-Llama-3-8B-Instruct
 
 ## Training
