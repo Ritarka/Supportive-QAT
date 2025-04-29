@@ -4,6 +4,7 @@ Official PyTorch implementation of **SupportiveQAT**, a framework for improving 
 ## Contents
 - [Installation](#installation)
 - [Training](#training)
+- [Files](#files)
 - [Citation](#citation)
 
 ## Installation
@@ -26,6 +27,46 @@ We support end-to-end QAT training with EASGD. Ensure that the model paths and o
 ```
 bash examples/e2e_qp/Llama-2-7b/w2g64-redpajama.sh
 ```
+
+## Files
+
+The file `main_e2e_qp.py` implements the **End-to-End Quantization-Aware Training (E2E-QP)** pipeline for LLMs under quantization constraints.
+
+### Main Features
+
+- **Quantized Model Loading**  
+  Supports loading blockwise pre-quantized models and applying fine-tuning using quantized layers (`QuantLinear`).
+
+- **Elastic Averaging SGD (EASGD)**  
+  Implements a multi-worker EASGD method to mitigate weight oscillation issues during quantized training.
+
+- **Hyperparameter Flexibility**  
+  Exposes tuning of `α`, `β`, and stickiness parameters for EASGD via command-line arguments.
+
+- **Automatic Device Management**  
+  Efficient GPU memory usage by swapping models between CPU and GPU.
+
+- **Training Options**  
+  Supports both EASGD-based training and standard fine-tuning with `AdamW`.
+
+- **Dataset Handling**  
+  Prepares training/validation sets dynamically (supports WikiText2, RedPajama, Alpaca formats).
+
+- **Evaluation**  
+  Optionally performs Perplexity (PPL) and LM-Eval benchmark tasks (e.g., PIQA, ARC).
+
+- **Logging**  
+  Integrated with Weights & Biases (WandB) for experiment tracking.
+
+- **Reproducibility**  
+  Includes checkpointing, seeding, and caching logic.
+
+### Key Files Used
+
+- `quantize/int_linear_real.py`: Quantized layer and model structure.
+- `datautils_block.py` and `datautils_e2e.py`: Dataset loading and preprocessing utilities.
+- `utils.py`: Logging and helper utilities.
+- `examples/e2e_qp/Llama-2-7b/w2g64-redpajama.sh`: Example script to launch E2E-QP training.
 
 ## Citation
 If you found this work useful, please consider citing:
