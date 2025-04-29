@@ -778,7 +778,7 @@ def send_email(message, subject=None):
     smtp_server = "smtp.gmail.com"
     sender_email = "ritarka.samanta@gmail.com"  # Enter your address
     receiver_email = "ritarka.samanta@gmail.com"  # Enter receiver address
-    password = "tlgh twex qjuj tnzl"
+    password = ""
     message = (
         f"Subject: {subject}\n"
         f"\n"
@@ -844,5 +844,3 @@ if __name__ == "__main__":
             message=f"Error during training: {e}",
             subject="Training Error"
         )
-        traceback.print_exc()
-        wandb.finish(exit_code=-1)
